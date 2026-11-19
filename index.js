@@ -1,16 +1,24 @@
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const ffmpegPath = require('ffmpeg-static');
 const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
+const ffmpegPath = fs.existsSync('/usr/bin/ffmpeg')
+    ? '/usr/bin/ffmpeg'
+    : require('ffmpeg-static');
+
 const browserPaths = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome',
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
     'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
-];
+].filter(Boolean);
+
 const executablePath = browserPaths.find((p) => fs.existsSync(p));
 
 if (!executablePath) {
@@ -47,7 +55,12 @@ const client = new Client({
     ffmpegPath: ffmpegPath,
     puppeteer: {
         executablePath: executablePath,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu'
+        ]
     }
 });
 
@@ -134,7 +147,6 @@ function safeUnlink(filePath) {
     }
 }
 
-// Memastikan video berformat MP4 (H.264 + AAC + yuv420p) agar tidak melempar "Error: t" di WhatsApp Web
 function ensureWhatsAppCompatibleVideo(inputPath) {
     return new Promise((resolve) => {
         execFile(ffmpegPath, ['-i', inputPath], (err, stdout, stderr) => {
@@ -179,7 +191,6 @@ function ensureWhatsAppCompatibleVideo(inputPath) {
     });
 }
 
-// Mengirim media dengan fallback otomatis ke dokumen jika WhatsApp menolak render video/gambar
 async function sendMediaSafe(chatId, media, options = {}) {
     try {
         await client.sendMessage(chatId, media, options);
@@ -196,7 +207,6 @@ async function sendMediaSafe(chatId, media, options = {}) {
     }
 }
 
-// Mengirim file video dari disk setelah memastikan kompatibilitas codec H.264
 async function sendVideoFileFromDisk(chatId, rawFilePath) {
     let finalPath = rawFilePath;
     try {
@@ -214,7 +224,6 @@ async function sendVideoFileFromDisk(chatId, rawFilePath) {
     }
 }
 
-// Mengunduh URL ke file sementara di disk
 async function downloadUrlToTempFile(mediaUrl, referer = '', defaultExt = 'mp4') {
     const headers = {
         'User-Agent': USER_AGENT,
@@ -268,7 +277,6 @@ async function fetchMediaAsMessageMedia(mediaUrl, referer = 'https://www.instagr
     return new MessageMedia(contentType, base64Data, `media_${Date.now()}.${ext}`);
 }
 
-// Mengirim daftar item [{ type: 'image' | 'video', url }] ke pengguna
 async function sendExtractedMediaItems(chatId, items, referer, makeSticker = false) {
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
@@ -425,7 +433,6 @@ function parseEmbedHtmlForMedia(html) {
     return [];
 }
 
-// 1. EKSTRAKTOR INSTAGRAM (Post, Carousel 20 Slide, Reels)
 async function extractInstagramMedia(rawUrl) {
     let targetUrl = rawUrl;
     if (/\/share\//i.test(rawUrl)) {
@@ -580,7 +587,6 @@ async function extractInstagramMedia(rawUrl) {
     return [];
 }
 
-// 2. EKSTRAKTOR TIKTOK (Mendukung Video Tanpa Watermark & Slideshow Foto)
 async function extractTikTokMedia(rawUrl) {
     try {
         const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(rawUrl)}&hd=1`;
@@ -596,13 +602,11 @@ async function extractTikTokMedia(rawUrl) {
             const json = await res.json();
             const data = json?.data;
             if (data) {
-                // Jika postingan TikTok berupa Slideshow Foto
                 if (Array.isArray(data.images) && data.images.length > 0) {
                     console.log(`[TikTok] Mendeteksi ${data.images.length} slide foto.`);
                     return data.images.map((imgUrl) => ({ type: 'image', url: imgUrl }));
                 }
 
-                // Jika postingan TikTok berupa Video (prioritaskan stream H.264 play agar ringan & kompatibel)
                 const videoUrl = data.play || data.hdplay || data.wmplay;
                 if (videoUrl) {
                     const fullVideoUrl = videoUrl.startsWith('http')
@@ -619,7 +623,6 @@ async function extractTikTokMedia(rawUrl) {
     return [];
 }
 
-// 3. EKSTRAKTOR X / TWITTER (Mendukung Multi-Foto 1-4 Gambar, GIF & Video)
 async function extractTwitterMedia(rawUrl) {
     let targetUrl = rawUrl;
     if (getCleanHostname(rawUrl) === 't.co') {
@@ -638,7 +641,6 @@ async function extractTwitterMedia(rawUrl) {
     if (!match) return [];
     const statusId = match[1];
 
-    // Coba via FxTwitter API
     try {
         const res = await fetch(`https://api.fxtwitter.com/status/${statusId}`, {
             signal: AbortSignal.timeout(15000),
@@ -657,7 +659,6 @@ async function extractTwitterMedia(rawUrl) {
         }
     } catch {}
 
-    // Fallback via VxTwitter API
     try {
         const res = await fetch(`https://api.vxtwitter.com/Twitter/status/${statusId}`, {
             signal: AbortSignal.timeout(15000),
@@ -679,7 +680,6 @@ async function extractTwitterMedia(rawUrl) {
     return [];
 }
 
-// 4. EKSTRAKTOR THREADS (Mendukung Video & Multi-Foto Carousel)
 async function extractThreadsMedia(rawUrl) {
     const match = rawUrl.match(/threads\.(?:net|com)\/(?:@[^/]+\/post|t)\/([A-Za-z0-9_-]+)/i);
     const shortcode = match ? match[1] : null;
@@ -779,7 +779,6 @@ async function extractThreadsMedia(rawUrl) {
     return [];
 }
 
-// 5. EKSTRAKTOR FACEBOOK FALLBACK (Untuk link /share/r/, Reels, dan Post Foto FB)
 async function extractFacebookMediaWithPuppeteer(rawUrl) {
     if (!client.pupBrowser) return { resolvedUrl: rawUrl, items: [] };
 
@@ -793,7 +792,6 @@ async function extractFacebookMediaWithPuppeteer(rawUrl) {
         const html = await page.content();
         const items = [];
 
-        // Cari URL MP4 langsung di dalam source halaman Facebook
         const hdMatch =
             html.match(/"browser_native_hd_url"\s*:\s*"([^"]+)"/) ||
             html.match(/"playable_url_quality_hd"\s*:\s*"([^"]+)"/);
@@ -1011,7 +1009,6 @@ client.on('message', async (msg) => {
     const text = (msg.body || '').trim();
 
     try {
-        // Sesi balasan pilihan format YouTube
         if (pendingYoutubeChoices.has(msg.from)) {
             const normalized = text.toLowerCase();
 
@@ -1041,7 +1038,6 @@ client.on('message', async (msg) => {
             }
         }
 
-        // Fitur 1: Ubah gambar atau video/GIF langsung menjadi stiker
         if (msg.hasMedia) {
             const media = await msg.downloadMedia();
             if (!media) return;
@@ -1062,7 +1058,6 @@ client.on('message', async (msg) => {
             }
         }
 
-        // Fitur 2: Deteksi link dari berbagai platform
         const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/i);
         if (urlMatch) {
             const url = urlMatch[0];
@@ -1071,7 +1066,6 @@ client.on('message', async (msg) => {
                 throw new Error('URL tidak valid.');
             }
 
-            // A. YOUTUBE
             if (isYoutubeUrl(url)) {
                 setYoutubeSession(msg.from, url);
                 await msg.reply(
@@ -1087,7 +1081,6 @@ client.on('message', async (msg) => {
             console.log(`Mendeteksi link dari ${msg.from}: ${url}`);
             await msg.react('⏳');
 
-            // B. INSTAGRAM (Post, Multi-Slide Carousel, Reels)
             if (isInstagramUrl(url)) {
                 const igItems = await extractInstagramMedia(url);
                 if (igItems.length > 0) {
@@ -1097,7 +1090,6 @@ client.on('message', async (msg) => {
                 }
             }
 
-            // C. TIKTOK (Video Tanpa Watermark & Foto Slideshow)
             if (isTikTokUrl(url)) {
                 const ttItems = await extractTikTokMedia(url);
                 if (ttItems.length > 0) {
@@ -1110,7 +1102,6 @@ client.on('message', async (msg) => {
                 return;
             }
 
-            // D. X / TWITTER (Multi-Foto 1-4 Gambar, GIF & Video)
             if (isTwitterUrl(url)) {
                 const xItems = await extractTwitterMedia(url);
                 if (xItems.length > 0) {
@@ -1123,7 +1114,6 @@ client.on('message', async (msg) => {
                 return;
             }
 
-            // E. THREADS (Carousel Foto & Video)
             if (isThreadsUrl(url)) {
                 const threadsItems = await extractThreadsMedia(url);
                 if (threadsItems.length > 0) {
@@ -1133,7 +1123,6 @@ client.on('message', async (msg) => {
                 }
             }
 
-            // F. FACEBOOK (Reels, Share Link /share/r/, Watch & Post Foto)
             if (isFacebookUrl(url)) {
                 try {
                     await downloadAndSendViaYtDlp(msg.from, url, 'video', true);
@@ -1156,7 +1145,6 @@ client.on('message', async (msg) => {
                 }
             }
 
-            // G. LINK UMUM / WEBSITE LAINNYA
             const info = await inspectUrlSafe(url);
 
             if (info.type === 'image') {
